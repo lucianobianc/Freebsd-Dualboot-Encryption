@@ -1,228 +1,363 @@
 #!/bin/sh
-# FreeBSD bsdinstall Shell partitioning: fresh GELI-encrypted ZFS root.
-# Usage: sh /tmp/freebsd-clean-zfs-geli.sh nda0
-# Prerequisites: UEFI boot, existing GPT + EFI partition, and unallocated space.
-# Does NOT delete partitions, reuse an existing ZFS pool, or format the EFI partition.
+# FreeBSD 15.1 bsdinstall Shell helper. See README.md before use.
 set -eu
 umask 077
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+LC_ALL=C
+export LC_ALL
 
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
+usage() {
+    cat <<'HELP'
+Usage:
+  sh freebsd-zfs-geli-install.sh [--dry-run] [--backup-dir DIRECTORY] DISK
 
-[ "$(uname -s)" = FreeBSD ] || fail 'Run this from the FreeBSD installer.'
-[ "$(id -u)" -eq 0 ] || fail 'Run as root.'
-[ "$#" -eq 1 ] || fail 'Usage: sh install.sh nda0'
-DISK=${1#/dev/}
-case "$DISK" in
-    ''|*[!a-zA-Z0-9]*) fail 'Invalid disk name. Example: nda0' ;;
-esac
-[ -c "/dev/$DISK" ] || fail "Disk /dev/$DISK does not exist."
-
-# Make sure the target is a GPT disk. The header contains: => start size nda0 GPT.
-LAYOUT=$(gpart show -p "$DISK") || fail 'Cannot read partition table.'
-printf '%s\n' "$LAYOUT" | awk -v d="$DISK" \
-    '$1=="=>" && $4==d && $5=="GPT" {found=1} END {exit !found}' || \
-    fail "Disk /dev/$DISK does not have a GPT partition table."
-
-ESP_COUNT=$(printf '%s\n' "$LAYOUT" | awk '$4=="efi" {n++} END {print n+0}')
-[ "$ESP_COUNT" -eq 1 ] || fail 'Exactly one existing EFI partition is required.'
-ESP_PART=$(printf '%s\n' "$LAYOUT" | awk '$4=="efi" {print $3; exit}')
-[ -c "/dev/$ESP_PART" ] || fail "EFI partition /dev/$ESP_PART is missing."
-
-# A clean install must start from unallocated space, not existing FreeBSD partitions.
-if printf '%s\n' "$LAYOUT" | awk '$4=="freebsd-zfs" || $4=="freebsd-swap" {found=1} END {exit !found}'; then
-    fail 'Existing FreeBSD ZFS/swap partition detected. This fresh-install script will not reuse or erase it.'
-fi
-if zpool list -H -o name 2>/dev/null | grep -qx zroot; then
-    fail 'A pool named zroot is already imported. No changes were made.'
-fi
-if mount -p | awk '$2=="/mnt" {found=1} END {exit !found}'; then
-    fail '/mnt is already mounted. It must be free for the target ZFS root.'
-fi
-
-SECTOR_SIZE=$(diskinfo "/dev/$DISK" | awk 'NR==1 {print $2}')
-case "$SECTOR_SIZE" in ''|*[!0-9]*|0) fail 'Cannot determine logical sector size.' ;; esac
-MIN_SECTORS=$(( (2 * 1024 * 1024 * 1024 + SECTOR_SIZE - 1) / SECTOR_SIZE ))
-FREE_REGIONS=$(printf '%s\n' "$LAYOUT" | awk -v min="$MIN_SECTORS" \
-    '$3=="-" && $4=="free" && $2>=min {print $1, $2}')
-REGION_COUNT=$(printf '%s\n' "$FREE_REGIONS" | awk 'NF {n++} END {print n+0}')
-[ "$REGION_COUNT" -ge 1 ] || fail 'No suitable unallocated space (at least 2 GiB) was found.'
-[ "$REGION_COUNT" -eq 1 ] || fail 'More than one large free region exists. Refusing to guess which one to use.'
-FREE_START=$(printf '%s\n' "$FREE_REGIONS" | awk '{print $1}')
-FREE_SECTORS=$(printf '%s\n' "$FREE_REGIONS" | awk '{print $2}')
-FREE_BYTES=$((FREE_SECTORS * SECTOR_SIZE))
-FREE_GIB=$(awk -v bytes="$FREE_BYTES" 'BEGIN {printf "%.2f", bytes/(1024*1024*1024)}')
-
-# Restrict sizes to simple binary units accepted by gpart (e.g. 512M, 4G, 1T).
-check_size() {
-    printf '%s\n' "$1" | awk '/^[1-9][0-9]*[MmGgTt]$/ {ok=1} END {exit !ok}' || \
-        fail "Invalid size '$1'. Use a value such as 512M, 4G or 1T."
+Run once from bsdinstall's partitioning Shell, booted in UEFI mode.
+After success, type exit and complete bsdinstall normally.
+--dry-run checks prerequisites and prints a plan; it makes no disk changes.
+--backup-dir retains recovery files in a NEW subdirectory of your chosen directory.
+Without it, the external recovery copy is temporary and lost on reboot.
+HELP
+}
+require_device() { [ -c "/dev/$1" ] || fail "Missing device /dev/$1."; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "Required tool not found: $1"; }
+read_answer() { IFS= read -r ANSWER || fail 'Input cancelled.'; }
+# Restrict decimal input BEFORE shell arithmetic. Values stay below 2^53,
+# allowing exact integer comparisons in awk as well as safe signed shell math.
+uint() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 16 ] && awk -v n="$1" 'BEGIN {exit !(n <= 4503599627370495)}'
 }
 size_bytes() {
-    number=${1%?}
-    unit=${1#"$number"}
-    case "$unit" in
-        M|m) factor=1048576 ;;
-        G|g) factor=1073741824 ;;
-        T|t) factor=1099511627776 ;;
-    esac
+    value=$1
+    case "$value" in *[Mm]) factor=1048576 ;; *[Gg]) factor=1073741824 ;; *[Tt]) factor=1099511627776 ;; *) fail 'Use sizes such as 512M, 4G or 1T.' ;; esac
+    number=${value%?}
+    case "$number" in ''|0*|*[!0-9]*) fail 'Size must start with a nonzero decimal digit.' ;; esac
+    [ "${#number}" -le 10 ] || fail 'Size is too large.'
+    [ "$number" -le "$((4503599627370495 / factor))" ] || fail 'Size is too large.'
     printf '%s\n' "$((number * factor))"
 }
-
-printf '\nDisk partition table:\n'
-printf '%s\n' "$LAYOUT"
-printf '\nSelected unallocated region: %.2f GiB (starting sector %s)\n' "$FREE_GIB" "$FREE_START"
-printf 'Create a swap partition? [y/N]: '
-IFS= read -r ANSWER || fail 'Input cancelled.'
-case "$ANSWER" in
-    y|Y|yes|YES|Yes)
-        printf 'Swap size [4G]: '
-        IFS= read -r SWAP_SIZE || fail 'Input cancelled.'
-        SWAP_SIZE=${SWAP_SIZE:-4G}
-        check_size "$SWAP_SIZE"
-        SWAP_BYTES=$(size_bytes "$SWAP_SIZE")
-        ;;
-    n|N|no|NO|No|'')
-        SWAP_SIZE=''
-        SWAP_BYTES=0
-        ;;
-    *) fail 'Enter y or n for swap.' ;;
-esac
-
-printf 'ZFS partition size [Enter = all remaining space]: '
-IFS= read -r ZFS_SIZE || fail 'Input cancelled.'
-if [ -n "$ZFS_SIZE" ]; then
-    check_size "$ZFS_SIZE"
-    ZFS_BYTES=$(size_bytes "$ZFS_SIZE")
-else
-    ZFS_BYTES=$((FREE_BYTES - SWAP_BYTES))
-fi
-# Leave a little space for alignment when a size is explicitly requested.
-[ "$ZFS_BYTES" -ge 4294967296 ] || fail 'ZFS needs at least 4 GiB after swap.'
-if [ -n "$ZFS_SIZE" ]; then
-    [ $((SWAP_BYTES + ZFS_BYTES + 1048576)) -le "$FREE_BYTES" ] || \
-        fail 'Requested sizes exceed the unallocated region (including alignment reserve).'
-else
-    [ $((SWAP_BYTES + 4294967296 + 1048576)) -le "$FREE_BYTES" ] || \
-        fail 'Not enough free space for swap and a minimum 4 GiB ZFS root.'
-fi
-
-printf '\nInstallation plan:\n'
-printf '  Disk:       /dev/%s\n' "$DISK"
-printf '  EFI:        /dev/%s (preserved)\n' "$ESP_PART"
-printf '  Swap:       %s\n' "${SWAP_SIZE:-none}"
-printf '  ZFS:        %s\n' "${ZFS_SIZE:-all remaining space}"
-printf '  Encryption: GELI with boot-time passphrase\n'
-printf '  Dataset:    zroot/ROOT/default (/) and zroot/home (/usr/home)\n'
-printf '\nOnly new partitions in the selected free region will be created.\n'
-printf 'GELI initialization and ZFS creation overwrite data within the NEW ZFS partition.\n'
-printf 'Type INSTALL to continue: '
-IFS= read -r CONFIRM || fail 'Input cancelled.'
-[ "$CONFIRM" = INSTALL ] || fail 'Cancelled. No changes were made.'
-
-kldload zfs 2>/dev/null || kldstat -q -m zfs || fail 'Cannot load ZFS.'
-kldload geom_eli 2>/dev/null || kldstat -q -m geom_eli || fail 'Cannot load GELI.'
-
-# Use the selected free range, not the first arbitrary gap on the disk.
-if [ -n "$SWAP_SIZE" ]; then
-    step 'Creating swap partition'
-    OUT=$(gpart add -a 4k -b "$FREE_START" -s "$SWAP_SIZE" -l swap0 -t freebsd-swap "$DISK") || \
-        fail 'Could not create the swap partition.'
-    SWAP_PART=$(printf '%s\n' "$OUT" | awk 'NR==1 {print $1}')
-    [ -c "/dev/$SWAP_PART" ] || fail 'Swap partition was not found after creation.'
-    # Query again: the remaining free area now starts after the new swap partition.
-    LAYOUT=$(gpart show -p "$DISK") || fail 'Cannot refresh the partition table.'
-    FREE_REGIONS=$(printf '%s\n' "$LAYOUT" | awk -v min="$MIN_SECTORS" \
-        '$3=="-" && $4=="free" && $2>=min {print $1, $2}')
-    REGION_COUNT=$(printf '%s\n' "$FREE_REGIONS" | awk 'NF {n++} END {print n+0}')
-    [ "$REGION_COUNT" -eq 1 ] || fail 'Cannot identify the remaining free region after creating swap.'
-    ZFS_START=$(printf '%s\n' "$FREE_REGIONS" | awk '{print $1}')
-else
-    ZFS_START=$FREE_START
-fi
-
-step 'Creating ZFS partition'
-if [ -n "$ZFS_SIZE" ]; then
-    OUT=$(gpart add -a 4k -b "$ZFS_START" -s "$ZFS_SIZE" -l zfs0 -t freebsd-zfs "$DISK") || \
-        fail 'Could not create the ZFS partition.'
-else
-    OUT=$(gpart add -a 4k -b "$ZFS_START" -l zfs0 -t freebsd-zfs "$DISK") || \
-        fail 'Could not create the ZFS partition.'
-fi
-ZFS_PART=$(printf '%s\n' "$OUT" | awk 'NR==1 {print $1}')
-[ -c "/dev/$ZFS_PART" ] || fail 'ZFS partition was not found after creation.'
-case "$ZFS_PART" in "$DISK"p*) : ;; *) fail 'Unexpected ZFS partition device name.' ;; esac
-
-step "Initializing GELI on /dev/$ZFS_PART"
-geli init -bg -l 256 -s 4096 "/dev/$ZFS_PART" || fail 'geli init failed.'
-geli attach "/dev/$ZFS_PART" || fail 'geli attach failed.'
-[ -c "/dev/$ZFS_PART.eli" ] || fail 'Encrypted device was not created.'
-
-step 'Creating ZFS pool and datasets'
-mkdir -p /mnt
-zpool create -f -o altroot=/mnt -o ashift=12 \
-    -O compression=lz4 -O atime=off -m none \
-    zroot "/dev/$ZFS_PART.eli" || fail 'zpool create failed.'
-zfs create -o mountpoint=none zroot/ROOT || fail 'Cannot create zroot/ROOT.'
-zfs create -o mountpoint=/ zroot/ROOT/default || fail 'Cannot create root dataset.'
-zfs set canmount=noauto zroot/ROOT/default || fail 'Cannot set canmount.'
-zpool set bootfs=zroot/ROOT/default zroot || fail 'Cannot set bootfs.'
-zfs create -o mountpoint=/usr/home zroot/home || fail 'Cannot create home dataset.'
-
-# Guard against repeating the previous error: /mnt MUST be on the ZFS root,
-# not on tmpfs or the installer's RAM filesystem.
-zfs mount | awk '$1=="zroot/ROOT/default" && $2=="/mnt" {found=1} END {exit !found}' || \
-    fail 'The ZFS root is not mounted at /mnt. Do not continue bsdinstall.'
-[ "$(zpool get -H -o value bootfs zroot)" = zroot/ROOT/default ] || \
-    fail 'Incorrect bootfs: aborting before installation.'
-ln -s /usr/home /mnt/home
-mkdir -p /mnt/tmp /mnt/var/tmp /mnt/boot/efi
-chmod 1777 /mnt/tmp /mnt/var/tmp
-
-step 'Preparing bsdinstall configuration files'
-mkdir -p /tmp/bsdinstall_etc /tmp/bsdinstall_boot
-printf 'zfs_enable="YES"\n' >> /tmp/bsdinstall_etc/rc.conf
-printf 'geom_eli_load="YES"\nzfs_load="YES"\n' >> /tmp/bsdinstall_boot/loader.conf
-printf 'vfs.root.mountfrom="zfs:zroot/ROOT/default"\n' >> /tmp/bsdinstall_boot/loader.conf
-printf 'tmpfs\t/tmp\ttmpfs\trw,mode=1777\t0\t0\n' >> /tmp/bsdinstall_etc/fstab
-printf '/dev/%s\t/boot/efi\tmsdosfs\trw\t2\t2\n' "$ESP_PART" >> /tmp/bsdinstall_etc/fstab
-if [ -n "$SWAP_SIZE" ]; then
-    # FreeBSD automatically creates an ephemeral GELI provider for .eli swap.
-    printf '/dev/gpt/swap0.eli\tnone\tswap\tsw\t0\t0\n' >> /tmp/bsdinstall_etc/fstab
-fi
-
-step 'Installing FreeBSD UEFI loader into the existing EFI partition'
-ESP_MOUNT=/media
-[ -z "$(mount -p | awk '$2=="/media" {print $1; exit}')" ] || \
-    fail '/media is already mounted; refusing to overwrite another mount.'
-[ -f /boot/loader.efi ] || fail 'FreeBSD loader.efi is missing on the installer media.'
-mkdir -p "$ESP_MOUNT"
-ESP_MOUNTED=0
-cleanup() {
-    if [ "$ESP_MOUNTED" -eq 1 ]; then
-        umount "$ESP_MOUNT" >/dev/null 2>&1 || true
+align_up() { printf '%s\n' "$(( ($1 + ALIGN - 1) / ALIGN * ALIGN ))"; }
+plan_sectors() {
+    START=$(align_up "$FREE_START")
+    END=$(( (FREE_START + FREE_SECTORS) / ALIGN * ALIGN ))
+    SWAP_SECTORS=$((SWAP_BYTES / SECTOR_SIZE))
+    ZFS_START=$((START + SWAP_SECTORS))
+    if [ "$ZFS_BYTES" -eq 0 ]; then
+        ZFS_SECTORS=$((END - ZFS_START))
+    else
+        ZFS_SECTORS=$((ZFS_BYTES / SECTOR_SIZE))
     fi
+    [ "$ZFS_SECTORS" -ge "$((4294967296 / SECTOR_SIZE))" ] || fail 'At least 4 GiB is required for ZFS (20 GiB or more is recommended).'
+    [ "$ZFS_START" -ge "$START" ] && [ "$((ZFS_START + ZFS_SECTORS))" -le "$END" ] || fail 'Requested sizes exceed the selected free region.'
 }
-trap cleanup 0
-mount -t msdosfs "/dev/$ESP_PART" "$ESP_MOUNT" || fail 'Cannot mount EFI partition.'
-ESP_MOUNTED=1
-mkdir -p "$ESP_MOUNT/EFI/freebsd"
-cp /boot/loader.efi "$ESP_MOUNT/EFI/freebsd/loader.efi" || fail 'Cannot copy EFI loader.'
-sync
-if command -v efibootmgr >/dev/null 2>&1; then
-    if ! efibootmgr -a -c -l "$ESP_MOUNT/EFI/freebsd/loader.efi" -L FreeBSD; then
-        printf 'WARNING: EFI loader was copied, but NVRAM registration failed.\n' >&2
+mount_table() { MOUNTS=$(mount -p) || fail 'Cannot read mount table.'; }
+path_safe() {
+    case "$1" in /*) ;; *) fail "Expected an absolute path: $1" ;; esac
+    case "$1" in *[!a-zA-Z0-9_./-]*|*/../*|*/..|*/./*|*/.) fail "Unsupported path: $1 (use a simple absolute path without whitespace or dot components)." ;; esac
+    [ "$1" != / ] || fail 'Refusing to use / as a working directory.'
+}
+path_unmounted() {
+    printf '%s\n' "$MOUNTS" | awk -v p="$1" '$2==p || index($2,p"/")==1 {found=1} END {exit !found}' && fail "A filesystem is mounted at or below $1."
+    return 0
+}
+# Query partition UUIDs from GEOM metadata, independently of GPT labels.
+part_uuid() {
+    geom part list "$DISK" | awk -v p="$1" '
+        $1 ~ /^[0-9]+\.$/ && $2=="Name:" {matchpart=($3==p)}
+        matchpart && $1=="rawuuid:" {print $2; n++}
+        END {if(n!=1) exit 1}'
+}
+valid_uuid() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+}
+boot_order() {
+    awk '$1=="BootOrder" && $2==":" {print $3; n++} END {if(n!=1) exit 1}'
+}
+valid_order() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9A-Fa-f]{4}(,[0-9A-Fa-f]{4})*$'
+}
+save_field() { printf '%s\n' "$2" > "$SESSION/$1"; }
+cleanup() {
+    status=$?
+    trap - 0
+    if [ "${ORDER_PENDING:-0}" -eq 1 ]; then
+        efibootmgr -o "$OLD_ORDER" || printf "WARNING: Restore BootOrder manually: efibootmgr -o %s\n" "$OLD_ORDER" >&2
     fi
-else
-    printf 'WARNING: efibootmgr not available; EFI loader was copied.\n' >&2
-fi
-umount "$ESP_MOUNT" || fail 'Unable to unmount EFI partition.'
-ESP_MOUNTED=0
-trap - 0
+    if [ "${ESP_MOUNTED:-0}" -eq 1 ]; then
+        umount "$ESP_MOUNT" || printf 'WARNING: Could not unmount %s\n' "$ESP_MOUNT" >&2
+    fi
+    if [ "$status" -ne 0 ] && [ -n "${SESSION:-}" ]; then
+        printf '\nStopped. Recovery/session files: %s\n' "$SESSION" >&2
+        printf 'No automatic partition deletion or pool destruction was attempted.\n' >&2
+        printf 'Do not resume bsdinstall after a failed preparation. Inspect the recorded plan and actual disk first.\n' >&2
+    fi
+    exit "$status"
+}
+preflight() {
+    [ "$(uname -s)" = FreeBSD ] || fail 'Run this from the FreeBSD installer.'
+    [ "$(id -u)" -eq 0 ] || fail 'Run as root.'
+    case "$(freebsd-version -u)" in 15.1-*) ;; *) fail 'This helper targets FreeBSD 15.1 installer media.' ;; esac
+    [ "$(sysctl -n machdep.bootmethod)" = UEFI ] || fail 'Boot the installer in UEFI mode.'
+    [ "$(uname -m)" = amd64 ] || fail 'Only amd64 UEFI installations are currently supported.'
+    LOADER=/boot/loader.efi
+    [ -f "$LOADER" ] && [ ! -L "$LOADER" ] || fail 'Installer loader.efi is missing or is a symlink.'
+    for tool in awk grep geom gpart diskinfo geli zpool zfs mount umount efibootmgr mktemp realpath df cp cmp tar uuidgen du kldload ls; do need "$tool"; done
+}
+read_disk() {
+    LAYOUT=$(gpart show -p "$DISK") || fail 'Cannot read GPT.'
+    printf '%s\n' "$LAYOUT" | awk -v d="$DISK" '$1=="=>" && $4==d && $5=="GPT" {n++} END {exit n!=1}' || fail 'Expected a healthy GPT disk.'
+    case "$LAYOUT" in *CORRUPT*|*RECOVER*) fail 'GPT requires recovery; refusing to modify it.' ;; esac
+}
+# Require successful GEOM output and verify exact start/size/type after creation.
+verify_partition() {
+    actual=$(gpart show -p "$DISK") || fail 'Cannot verify partition table.'
+    printf '%s\n' "$actual" | awk -v p="$1" -v s="$2" -v n="$3" -v t="$4" '$3==p && $1==s && $2==n && $4==t {ok=1} END {exit !ok}' || fail 'Created partition does not match the confirmed plan.'
+    require_device "$1"
+}
+prepare() {
+    [ -n "${BSDINSTALL_CHROOT:-}" ] && [ -n "${BSDINSTALL_TMPETC:-}" ] && [ -n "${BSDINSTALL_TMPBOOT:-}" ] && [ -n "${PATH_FSTAB:-}" ] || fail 'Use the Shell option in bsdinstall partitioning (installer variables are required).'
+    [ -f "${LOADER:-/boot/loader.efi}" ] || fail 'Installer loader.efi is missing.'
+    TARGET=$BSDINSTALL_CHROOT
+    ETC=$BSDINSTALL_TMPETC
+    BOOT=$BSDINSTALL_TMPBOOT
+    FSTAB=$PATH_FSTAB
+    for p in "$TARGET" "$ETC" "$BOOT" "$FSTAB"; do path_safe "$p"; done
+    for p in "$TARGET" "$ETC" "$BOOT"; do
+        [ -d "$p" ] && [ ! -L "$p" ] || fail "Expected an existing, non-symlink directory: $p"
+        [ "$(realpath "$p")" = "$p" ] || fail "Use canonical paths: $p"
+    done
+    [ "$ETC" != "$BOOT" ] || fail 'Installer staging directories must differ.'
+    case "$FSTAB" in "$ETC"/fstab) ;; *) fail 'PATH_FSTAB must be BSDINSTALL_TMPETC/fstab.' ;; esac
+    [ ! -L "$FSTAB" ] && [ ! -s "$FSTAB" ] || fail 'An fstab already exists; refusing to append to another installation plan.'
+    [ ! -e "$ETC/rc.conf.dualboot" ] && [ ! -L "$ETC/rc.conf.dualboot" ] && [ ! -e "$BOOT/loader.conf.dualboot" ] && [ ! -L "$BOOT/loader.conf.dualboot" ] || fail 'Previous dualboot configuration found.'
+    require_device "$DISK"
+    read_disk
+    if printf '%s\n' "$LAYOUT" | awk '$4 ~ /^freebsd-/ {found=1} END {exit !found}'; then
+        fail 'Existing FreeBSD partitions found. This is a fresh-install helper, not a resume or upgrade tool.'
+    fi
+    ESP_COUNT=$(printf '%s\n' "$LAYOUT" | awk '$4=="efi" {n++} END {print n+0}')
+    [ "$ESP_COUNT" -eq 1 ] || fail 'Exactly one existing EFI partition on the selected disk is required.'
+    ESP_PART=$(printf '%s\n' "$LAYOUT" | awk '$4=="efi" {print $3}')
+    require_device "$ESP_PART"
+    ESP_UUID=$(part_uuid "$ESP_PART") || fail 'Cannot determine ESP GPT UUID.'
+    valid_uuid "$ESP_UUID" || fail 'Invalid ESP UUID.'
+    mount_table
+    path_unmounted "$TARGET"
+    CONTENTS=$(ls -A "$TARGET") || fail 'Cannot inspect target directory.'
+    [ -z "$CONTENTS" ] || fail 'Installation target directory must be empty.'
+    printf '%s\n' "$MOUNTS" | awk -v p="/dev/$ESP_PART" -v u="/dev/gptid/$ESP_UUID" '$1==p || $1==u {found=1} END {exit !found}' && fail 'The selected ESP is already mounted.'
+    # Load before querying: an unloaded module must not masquerade as an empty pool list.
+    kldload -n zfs || fail 'Cannot load ZFS.'
+    kldload -n geom_eli || fail 'Cannot load GELI.'
+    POOLS=$(zpool list -H -o name) || fail 'Cannot query imported pools.'
+    printf '%s\n' "$POOLS" | grep -qx zroot && fail 'A pool named zroot is already imported.'
+    BOOT_BEFORE=$(efibootmgr) || fail 'Cannot read UEFI boot entries.'
+    OLD_ORDER=$(printf '%s\n' "$BOOT_BEFORE" | boot_order) || fail 'Cannot read BootOrder.'
+    valid_order "$OLD_ORDER" || fail 'Unsupported or empty BootOrder.'
+    INFO=$(diskinfo "/dev/$DISK") || fail 'Cannot read disk geometry.'
+    SECTOR_SIZE=$(printf '%s\n' "$INFO" | awk 'NR==1 {print $2}')
+    case "$SECTOR_SIZE" in 512|4096) ;; *) fail 'Only 512-byte and 4096-byte logical sectors are supported.' ;; esac
+    ALIGN=$((1048576 / SECTOR_SIZE))
+    FREE_REGIONS=$(printf '%s\n' "$LAYOUT" | awk -v min="$((4294967296 / SECTOR_SIZE + ALIGN))" '$3=="-" && $4=="free" && $2>=min {print $1,$2}')
+    [ "$(printf '%s\n' "$FREE_REGIONS" | awk 'NF {n++} END {print n+0}')" -eq 1 ] || fail 'Expected exactly one unallocated region with at least 4 GiB plus alignment space.'
+    FREE_START=$(printf '%s\n' "$FREE_REGIONS" | awk '{print $1}')
+    FREE_SECTORS=$(printf '%s\n' "$FREE_REGIONS" | awk '{print $2}')
+    uint "$FREE_START" && uint "$FREE_SECTORS" || fail 'Unsupported disk geometry.'
+    [ "$FREE_START" -le "$((4503599627370495 - FREE_SECTORS))" ] || fail 'Disk geometry exceeds supported range.'
+    printf '\nTarget: /dev/%s\n' "$DISK"
+    diskinfo -v "/dev/$DISK" || fail 'Cannot display disk identity.'
+    printf '\n%s\n\nUEFI entries:\n%s\n' "$LAYOUT" "$BOOT_BEFORE"
+    printf '\nCreate encrypted swap? [y/N]: '
+    read_answer
+    SWAP_BYTES=0
+    case "$ANSWER" in
+        y|Y|yes) printf 'Swap size [4G]: '; read_answer; SWAP_BYTES=$(size_bytes "${ANSWER:-4G}") ;;
+        n|N|no|'') : ;;
+        *) fail 'Enter y or n.' ;;
+    esac
+    printf 'ZFS partition size [Enter = remaining selected region]: '
+    read_answer
+    ZFS_BYTES=0
+    [ -z "$ANSWER" ] || ZFS_BYTES=$(size_bytes "$ANSWER")
+    plan_sectors
+    printf '\nPlan (logical sectors, end exclusive):\n  Swap: start=%s size=%s\n  ZFS: start=%s size=%s end=%s\n  ESP: /dev/%s (no formatting)\n  Existing boot priority: preserved; FreeBSD appended during this execution\n' "$START" "$SWAP_SECTORS" "$ZFS_START" "$ZFS_SECTORS" "$((ZFS_START + ZFS_SECTORS))" "$ESP_PART"
+    printf '  GELI: AES-XTS, 256-bit key, 4096-byte sectors\n  ZFS: zroot/ROOT/default and shared /home, /tmp, /var datasets\n'
+    if [ -n "$BACKUP_DIR" ]; then
+        path_safe "$BACKUP_DIR"
+        [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ] || fail 'Backup directory must already exist and be writable.'
+        BACKUP_DIR=$(realpath "$BACKUP_DIR")
+        case "$BACKUP_DIR/" in "$TARGET/"*|"$ETC/"*|"$BOOT/"*) fail 'Choose a backup location outside the target and installer staging directories.' ;; esac
+        printf '  Recovery destination: %s (ensure this is another, persistent medium)\n' "$BACKUP_DIR"
+        df -h "$BACKUP_DIR" || fail 'Cannot inspect backup destination.'
+    else
+        printf '\nWARNING: Recovery files will be temporary and LOST ON REBOOT.\nUse --backup-dir on another mounted medium to retain them.\n'
+    fi
+    [ "$DRY_RUN" -eq 0 ] || { printf '\nDry run complete. No partitions, pools, configuration or ESP files were written.\n'; return; }
+    printf '\nType INSTALL %s to write this plan: ' "$DISK"
+    read_answer
+    [ "$ANSWER" = "INSTALL $DISK" ] || fail 'Cancelled. No disk changes were made.'
+    # Refuse a partition-table change between planning and confirmation.
+    CURRENT=$(gpart show -p "$DISK") || fail 'Cannot recheck partition table.'
+    [ "$CURRENT" = "$LAYOUT" ] || fail 'Partition table changed; rerun preparation.'
+    SESSION=$(mktemp -d "${BACKUP_DIR:-/tmp}/freebsd-dualboot.XXXXXXXX") || fail 'Cannot create recovery directory.'
+    trap cleanup 0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    printf '%s\n' "$LAYOUT" > "$SESSION/layout.before"
+    printf '%s\n' "$BOOT_BEFORE" > "$SESSION/uefi.before"
+    gpart backup "$DISK" > "$SESSION/gpt.before" || fail 'Cannot back up GPT.'
+    TOKEN=$(uuidgen) || fail 'Cannot generate unique installation ID.'
+    valid_uuid "$TOKEN" || fail 'Invalid generated UUID.'
+    SWAP_LABEL=swap-${TOKEN%%-*}
+    ZFS_LABEL=zfs-${TOKEN%%-*}
+    [ ! -e "/dev/gpt/$SWAP_LABEL" ] && [ ! -e "/dev/gpt/$ZFS_LABEL" ] || fail 'Generated GPT label already exists.'
+    for key in DISK TARGET ESP_PART ESP_UUID OLD_ORDER SWAP_LABEL ZFS_LABEL; do
+        case "$key" in
+            DISK) val=$DISK ;; TARGET) val=$TARGET ;; ESP_PART) val=$ESP_PART ;; ESP_UUID) val=$ESP_UUID ;;
+            OLD_ORDER) val=$OLD_ORDER ;; SWAP_LABEL) val=$SWAP_LABEL ;; ZFS_LABEL) val=$ZFS_LABEL ;;
+        esac
+        save_field "$key" "$val"
+    done
+    printf 'swap start=%s sectors=%s\nzfs start=%s sectors=%s\n' "$START" "$SWAP_SECTORS" "$ZFS_START" "$ZFS_SECTORS" > "$SESSION/plan"
+    # Read-only mount: archive the existing ESP before any partition changes.
+    ESP_MOUNT=$(mktemp -d /tmp/dualboot-esp.XXXXXXXX)
+    ESP_MOUNTED=0
+    mount -t msdosfs -o ro "/dev/$ESP_PART" "$ESP_MOUNT" || fail 'Cannot mount ESP read-only.'
+    ESP_MOUNTED=1
+    [ ! -e "$ESP_MOUNT/EFI/freebsd" ] && [ ! -e "$ESP_MOUNT/efi/freebsd" ] || fail 'An existing FreeBSD EFI directory was found; refusing to overwrite it.'
+    tar -cf "$SESSION/esp.before.tar" -C "$ESP_MOUNT" . || fail 'Cannot archive ESP.'
+    umount "$ESP_MOUNT" || fail 'Cannot unmount ESP.'
+    ESP_MOUNTED=0
+    rmdir "$ESP_MOUNT"
+    step 'Creating only the confirmed new partitions'
+    if [ "$SWAP_SECTORS" -gt 0 ]; then
+        OUT=$(gpart add -a 1m -b "$START" -s "$SWAP_SECTORS" -l "$SWAP_LABEL" -t freebsd-swap "$DISK") || fail 'Cannot create swap.'
+        SWAP_PART=$(printf '%s\n' "$OUT" | awk 'NR==1 {print $1}')
+        verify_partition "$SWAP_PART" "$START" "$SWAP_SECTORS" freebsd-swap
+        save_field SWAP_PART "$SWAP_PART"
+    fi
+    OUT=$(gpart add -a 1m -b "$ZFS_START" -s "$ZFS_SECTORS" -l "$ZFS_LABEL" -t freebsd-zfs "$DISK") || fail 'Cannot create ZFS partition.'
+    ZFS_PART=$(printf '%s\n' "$OUT" | awk 'NR==1 {print $1}')
+    verify_partition "$ZFS_PART" "$ZFS_START" "$ZFS_SECTORS" freebsd-zfs
+    ZFS_UUID=$(part_uuid "$ZFS_PART") || fail 'Cannot read new partition UUID.'
+    valid_uuid "$ZFS_UUID" || fail 'Invalid new partition UUID.'
+    save_field ZFS_PART "$ZFS_PART"
+    save_field ZFS_UUID "$ZFS_UUID"
+    step 'Initializing GELI (passphrase is never recorded)'
+    geli init -bg -e AES-XTS -l 256 -s 4096 -B "$SESSION/geli.metadata" "/dev/$ZFS_PART" || fail 'GELI initialization failed.'
+    geli attach "/dev/$ZFS_PART" || fail 'GELI attach failed.'
+    require_device "$ZFS_PART.eli"
+    step 'Creating ZFS pool and boot environment'
+    # No -f: do not override ZFS in-use/signature checks.
+    zpool create -o altroot="$TARGET" -o ashift=12 -O compression=lz4 -O atime=off -m none zroot "/dev/$ZFS_PART.eli" || fail 'Cannot create zroot; no force override is performed.'
+    zfs create -o mountpoint=none zroot/ROOT
+    zfs create -o mountpoint=/ zroot/ROOT/default
+    zfs set canmount=noauto zroot/ROOT/default
+    zpool set bootfs=zroot/ROOT/default zroot
+    zfs create -o mountpoint=/home zroot/home
+    zfs create -o mountpoint=/tmp -o setuid=off zroot/tmp
+    zfs create -o mountpoint=/usr -o canmount=off zroot/usr
+    zfs create -o setuid=off zroot/usr/ports
+    zfs create zroot/usr/src
+    zfs create -o mountpoint=/var -o canmount=off zroot/var
+    zfs create -o exec=off -o setuid=off zroot/var/audit
+    zfs create -o exec=off -o setuid=off zroot/var/crash
+    zfs create -o exec=off -o setuid=off zroot/var/log
+    zfs create -o atime=on zroot/var/mail
+    zfs create -o setuid=off zroot/var/tmp
+    MOUNTED=$(zfs mount) || fail 'Cannot query ZFS mounts.'
+    printf '%s\n' "$MOUNTED" | awk -v p="$TARGET" '$1=="zroot/ROOT/default" && $2==p {ok=1} END {exit !ok}' || fail 'Target is not mounted on the new root dataset.'
+    [ "$(zpool get -H -o value bootfs zroot)" = zroot/ROOT/default ] || fail 'Incorrect bootfs.'
+    mkdir -p "$TARGET/boot/zfs" "$TARGET/efi"
+    chmod 755 "$TARGET" "$TARGET/boot" "$TARGET/boot/zfs" "$TARGET/efi" "$TARGET/home"
+    chmod 1777 "$TARGET/tmp" "$TARGET/var/tmp"
+    zpool set cachefile="$TARGET/boot/zfs/zpool.cache" zroot
+    printf 'zfs_enable="YES"\n' > "$ETC/rc.conf.dualboot"
+    printf 'geom_eli_load="YES"\nzfs_load="YES"\n' > "$BOOT/loader.conf.dualboot"
+    # bootconfig recognizes /boot/efi specifically. A separate /efi mountpoint
+    # keeps ESP/BootOrder management here, without a second bsdinstall writer.
+    printf '/dev/gptid/%s\t/efi\tmsdosfs\trw,noauto\t0\t0\n' "$ESP_UUID" > "$FSTAB"
+    if [ "$SWAP_SECTORS" -gt 0 ]; then
+        printf '/dev/gpt/%s.eli\tnone\tswap\tsw\t0\t0\n' "$SWAP_LABEL" >> "$FSTAB"
+    fi
+    gpart backup "$DISK" > "$SESSION/gpt.after"
+    install_boot
+    mkdir -p "$TARGET/root/dualboot-recovery"
+    chmod 700 "$TARGET/root" "$TARGET/root/dualboot-recovery"
+    cp "$SESSION/gpt.before" "$SESSION/gpt.after" "$SESSION/geli.metadata" "$SESSION/plan" "$SESSION/uefi.before" "$SESSION/uefi.after" "$TARGET/root/dualboot-recovery/"
+    chmod 600 "$TARGET/root/dualboot-recovery/"*
+    save_field stage complete
+    printf '\nPreparation and EFI setup complete. Original boot priority retained.\n'
+    printf 'Recovery files: %s\nA second copy (except the ESP archive) is in the target /root/dualboot-recovery.\n' "$SESSION"
+    printf 'Type exit and complete bsdinstall normally; no second script execution is needed.\n'
+    printf 'Do not reboot until bsdinstall finishes. Then select %s in the firmware menu.\n' "$LABEL"
+    printf 'Keep an external copy of geli.metadata; files inside the encrypted pool cannot recover that pool.\n'
+}
+install_boot() {
+    # Called automatically by preparation. Never replaces existing EFI loaders.
+    [ "$(part_uuid "$ESP_PART")" = "$ESP_UUID" ] || fail 'ESP identity changed.'
+    BOOT_NOW=$(efibootmgr) || fail 'Cannot read current UEFI state.'
+    CURRENT_ORDER=$(printf '%s\n' "$BOOT_NOW" | boot_order) || fail 'Cannot read current BootOrder.'
+    [ "$CURRENT_ORDER" = "$OLD_ORDER" ] || fail 'BootOrder changed during preparation; inspect before proceeding.'
+    step 'Installing the FreeBSD loader from the installer media'
+    ESP_MOUNT=$(mktemp -d /tmp/dualboot-esp.XXXXXXXX)
+    ESP_MOUNTED=0
+    mount -t msdosfs "/dev/$ESP_PART" "$ESP_MOUNT" || fail 'Cannot mount ESP.'
+    ESP_MOUNTED=1
+    [ ! -e "$ESP_MOUNT/EFI/freebsd" ] && [ ! -e "$ESP_MOUNT/efi/freebsd" ] || fail 'FreeBSD EFI directory already exists; refusing to overwrite it.'
+    # FAT free-space check, with a 1 MiB margin.
+    AVAILABLE=$(df -k "$ESP_MOUNT" | awk 'END {print $4}')
+    REQUIRED=$(du -k "$LOADER" | awk '{print $1}')
+    uint "$AVAILABLE" && uint "$REQUIRED" || fail 'Cannot determine ESP capacity.'
+    [ "$AVAILABLE" -ge "$((REQUIRED + 1024))" ] || fail 'Not enough free space in ESP.'
+    mkdir -p "$ESP_MOUNT/EFI/freebsd"
+    cp "$LOADER" "$ESP_MOUNT/EFI/freebsd/loader.efi"
+    cmp "$LOADER" "$ESP_MOUNT/EFI/freebsd/loader.efi" || fail 'EFI loader copy verification failed.'
+    sync
+    # Unique label: no removal or replacement of existing NVRAM entries.
+    LABEL="FreeBSD-${ZFS_UUID%%-*}"
+    printf '%s\n' "$BOOT_NOW" | awk -v l="$LABEL" '$NF==l {found=1} END {exit !found}' && fail 'The installation boot label already exists.'
+    ORDER_PENDING=1
+    if ! efibootmgr -a -c -L "$LABEL" -l "$ESP_MOUNT/EFI/freebsd/loader.efi"; then
+        # Creation can fail AFTER modifying BootOrder; attempt restoration.
+        fail 'Cannot create boot entry. ESP loader remains; inspect UEFI state before retrying.'
+    fi
+    AFTER=$(efibootmgr) || fail 'Cannot inspect new boot entry.'
+    printf '%s\n' "$AFTER" > "$SESSION/uefi.after-create"
+    NEW_ENTRY=$(printf '%s\n' "$AFTER" | awk -v l="$LABEL" '$NF==l && $1 ~ /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {s=$1; sub(/^Boot/,"",s); sub(/\*$/, "",s); print s; n++} END {if(n!=1) exit 1}') || fail 'Cannot identify the new boot entry.'
+    valid_order "$NEW_ENTRY" || fail 'Invalid boot entry ID.'
+    efibootmgr -o "$OLD_ORDER,$NEW_ENTRY" || fail 'Cannot preserve original boot priority.'
+    VERIFIED=$(efibootmgr) || fail 'Cannot verify BootOrder; inspect UEFI state before rebooting.'
+    [ "$(printf '%s\n' "$VERIFIED" | boot_order)" = "$OLD_ORDER,$NEW_ENTRY" ] || fail 'BootOrder verification failed.'
+    ORDER_PENDING=0
+    printf '%s\n' "$VERIFIED" > "$SESSION/uefi.after"
+    umount "$ESP_MOUNT" || fail 'Cannot unmount ESP.'
+    ESP_MOUNTED=0
+    rmdir "$ESP_MOUNT"
+    printf 'No Secure Boot signing/enrollment is performed. Boot must be tested on this machine.\n'
 
-step 'Final verification'
-zfs list -r zroot
-zpool get bootfs zroot
-printf '\nRoot mounted at /mnt: verified.\n'
-printf 'Partitioning is finished. Type exit to resume bsdinstall.\n'
-printf 'Do not reboot before the FreeBSD installer finishes.\n'
+}
+main() {
+    DRY_RUN=0
+    BACKUP_DIR=''
+    SESSION=''
+    ESP_MOUNTED=0
+    ORDER_PENDING=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --help|-h) usage; return ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --backup-dir) [ "$#" -ge 2 ] || fail 'Missing backup directory.'; BACKUP_DIR=$2; shift 2 ;;
+            --*) fail "Unknown option: $1" ;;
+            *) [ "$#" -eq 1 ] || fail 'Specify one disk.'; DISK=${1#/dev/}; shift ;;
+        esac
+    done
+    [ -n "${DISK:-}" ] || { usage; fail 'Specify a disk.'; }
+    case "$DISK" in ''|*[!a-zA-Z0-9]*) fail 'Invalid disk name (example: nda0).' ;; esac
+    preflight
+    prepare
+}
+main "$@"

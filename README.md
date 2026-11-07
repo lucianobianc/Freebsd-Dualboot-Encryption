@@ -18,37 +18,55 @@ FreeBSD loader: this helper does not sign EFI binaries, enroll keys, or change
 Secure Boot settings. Keep the script accessible in the installer environment,
 for example at `/tmp/freebsd-zfs-geli-install.sh`.
 
-In the installer's partitioning menu, select **Shell**. Identify your disk using
-its model, serial number, capacity and partition layout. The examples use `nda0`;
-replace it with your actual disk. The script accepts `/dev/nda0` as well.
-
-First inspect the plan:
+In the installer's partitioning menu, select **Shell**, then run:
 
 ```sh
-sh /tmp/freebsd-zfs-geli-install.sh --dry-run nda0
+sh /tmp/freebsd-zfs-geli-install.sh
 ```
 
-It prompts for optional encrypted swap and a ZFS size. Sizes are whole binary
-units such as `512M`, `4G` or `1T`. An empty ZFS size uses the remaining selected
-free region. The absolute minimum partition size is 4 GiB; allow **at least
-20 GiB**, and preferably more, for a useful installation and boot environments.
+The script lists detected devices with their model, serial and capacity. Enter
+the number of the **installation disk**; none is selected by default. The list
+can include installer media and devices unsuitable for this installation. Check
+the chosen disk's partition layout, which is displayed before any write. Enter
+`q` at the disk menu to cancel.
+
+It prompts for optional encrypted swap and a ZFS size, then asks whether to keep
+a recovery backup. Answer `y` (or `s`/`sim`) to enter a destination directory, or
+`n`/Enter to continue without a persistent external copy. All these choices are
+made before the final installation confirmation.
+
+Sizes are whole binary units such as `512M`, `4G` or `1T`. An empty ZFS size uses
+the remaining selected free region. The absolute minimum partition size is 4 GiB;
+allow **at least 20 GiB**, and preferably more, for a useful installation and boot
+environments.
+
+To inspect the interactive plan without writing:
+
+```sh
+sh /tmp/freebsd-zfs-geli-install.sh --dry-run
+```
+
 The dry run may load ZFS/GELI kernel modules but does not create partitions,
 pools, backups, installer configuration or EFI files.
 
-Prepare the installation:
+**Persistent recovery backup is optional.** If you decline, recovery files are
+kept under `/tmp/freebsd-dualboot.XXXXXXXX` on the installer and disappear on
+reboot. If you accept, enter an existing writable directory on the medium where
+you want to retain them. The script does not mount or format backup devices;
+mount a pendrive beforehand if you want to use one. `/media/recovery` is only an
+example, not a required mount point.
 
-```sh
-sh /tmp/freebsd-zfs-geli-install.sh nda0
-```
-
-**Persistent recovery backup is optional.** Without a destination, session and
-recovery files are kept under `/tmp/freebsd-dualboot.XXXXXXXX` on the installer.
-They disappear on reboot. To retain them, first mount another medium yourself,
-then use an existing directory there:
+Command-line choices remain available. Specify a disk to skip the disk menu,
+`--backup-dir` to skip the backup question with a chosen directory, or
+`--no-backup` to skip it without a persistent external copy. For example:
 
 ```sh
 sh /tmp/freebsd-zfs-geli-install.sh --backup-dir /media/recovery nda0
+sh /tmp/freebsd-zfs-geli-install.sh --no-backup nda0
 ```
+
+Replace `nda0` with your disk; `/dev/nda0` is also accepted. Do not combine the
+two backup options.
 
 A new session subdirectory is created; existing backup files are not replaced.
 The script displays the backing filesystem. You must ensure this is the intended
@@ -154,8 +172,8 @@ python3 -B -m unittest discover -s tests -v
 ```
 
 The host regression suite mocks FreeBSD commands. It covers size overflow,
-512/4096-byte sector plans, bounds, mount checks, identifier parsing, dry-run
-behavior, single-execution installation setup with and without swap and persistent backups,
+512/4096-byte sector plans, bounds, mount checks, identifier parsing, interactive disk and backup selection, cancellation,
+dry-run behavior, single-execution installation setup with and without swap and persistent backups,
 preservation of existing OS and fallback EFI files, and failures of pool queries,
 partition creation, GELI and UEFI writes (including a catchable interruption).
 These checks do not establish that GELI, firmware, FAT, ZFS mounts or booting

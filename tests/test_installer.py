@@ -90,7 +90,7 @@ geom() { printf 'Geom name: nda0\nProviders:\n1. Name: nda0p1\n   rawuuid: 11111
         for path in ['/', 'relative', '/mnt/../etc', '/mnt/a b']:
             self.run_shell('path_safe "$TEST_PATH"', success=False, extra_env={'TEST_PATH': path})
 
-    def mock_flow(self, fault='', dry=False, backup=False, swap=False):
+    def mock_flow(self, fault='', dry=False, backup=False, swap=False, interactive=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / 'target'
@@ -106,6 +106,8 @@ BSDINSTALL_CHROOT=$TARGET; BSDINSTALL_TMPETC="$TEST_ROOT/etc"; BSDINSTALL_TMPBOO
 DRY_RUN=DRY_VALUE; BACKUP_DIR=BACKUP_VALUE; SESSION=''; ESP_MOUNTED=0; ORDER_PENDING=0
 LOADER="$TEST_ROOT/media-loader.efi"
 printf 'installer loader\n' > "$LOADER"
+preflight() { :; }
+sysctl() { printf 'da0 nda0\n'; }
 log() { printf '%s\n' "$*" >> "$TEST_ROOT/commands"; }
 require_device() { :; }
 part_uuid() { case "$1" in nda0p1) printf '11111111-1111-1111-1111-111111111111\n';; *) printf '22222222-2222-2222-2222-222222222222\n';; esac; }
@@ -191,7 +193,8 @@ efibootmgr() {
         ;;
     esac
 }
-prepare
+INVOKE
+[ "$DISK" = nda0 ]
 if [ "$DRY_RUN" -eq 1 ]; then
     ! grep -Eq '^gpart (add|backup)|^geli|^zpool create|^mount ' "$TEST_ROOT/commands"
     [ ! -e "$PATH_FSTAB" ]
@@ -211,8 +214,16 @@ cmp "$TEST_ROOT/ESP_1/BOOT/BOOTX64.EFI" "$TEST_ROOT/ESP_2/BOOT/BOOTX64.EFI"
 printf '\nFLOW VERIFIED\n'
 '''
             code = code.replace('DRY_VALUE', str(int(dry))).replace('BACKUP_VALUE', '"$TEST_ROOT/backup"' if backup else "''")
+            options = '--dry-run ' if dry else ''
+            if not interactive:
+                options += '--backup-dir "$TEST_ROOT/backup" ' if backup else '--no-backup '
+                options += 'nda0'
+            code = code.replace('INVOKE', 'main ' + options)
             # Supply answers via read_answer, keeping stdin for the shell program.
-            inputs = (['y', '4G'] if swap else ['n']) + ['', 'INSTALL nda0']
+            inputs = (['2'] if interactive else []) + (['y', '4G'] if swap else ['n']) + ['']
+            if interactive:
+                inputs += ['y', str(recovery)] if backup else ['n']
+            inputs += ['INSTALL nda0']
             answers = root / 'answers'
             answers.write_text('\n'.join(inputs) + '\n')
             code = 'exec 3< "$TEST_ROOT/answers"\nread_answer() { IFS= read -r ANSWER <&3 || fail "No test answer"; }\n' + code
@@ -234,6 +245,47 @@ printf '\nFLOW VERIFIED\n'
                 import shutil
                 for path in re.findall(r'/tmp/freebsd-dualboot\.[A-Za-z0-9]+', result.stdout + result.stderr):
                     shutil.rmtree(path, ignore_errors=True)
+
+    def run_answers(self, code, answers, success=True):
+        with tempfile.TemporaryDirectory() as directory:
+            answer_file = Path(directory) / 'answers'
+            answer_file.write_text('\n'.join(answers) + '\n')
+            return self.run_shell(
+                'exec 3< "$ANSWER_FILE"\n'
+                'read_answer() { IFS= read -r ANSWER <&3 || fail "Input cancelled."; }\n' + code,
+                success=success, extra_env={'ANSWER_FILE': str(answer_file)})
+
+    def test_disk_menu_requires_explicit_valid_selection(self):
+        result = self.run_answers("""
+sysctl() { printf 'da0 nda0\n'; }
+diskinfo() { printf 'Model and serial for %s\n' "$2"; }
+choose_disk
+[ "$DISK" = nda0 ]
+""", ['', '0', '-1', '999999999999999999999', '3', '2'])
+        self.assertIn('[1] /dev/da0', result.stdout)
+        self.assertIn('[2] /dev/nda0', result.stdout)
+
+    def test_disk_menu_cancellation_and_discovery_failure(self):
+        self.run_answers("sysctl() { printf 'nda0\n'; }; diskinfo() { :; }; choose_disk", ['q'], success=False)
+        self.run_shell('sysctl() { return 1; }; choose_disk', success=False)
+        self.run_shell("sysctl() { printf ''; }; choose_disk", success=False)
+
+    def test_backup_question_yes_no_and_cancel(self):
+        self.run_answers('BACKUP_MODE=ask; BACKUP_DIR=; choose_backup; [ "$BACKUP_DIR" = /media/recovery ]',
+                         ['invalid', 'y', '/media/recovery'])
+        self.run_answers('BACKUP_MODE=ask; BACKUP_DIR=; choose_backup; [ -z "$BACKUP_DIR" ]', [''])
+        self.run_answers('BACKUP_MODE=ask; BACKUP_DIR=; choose_backup', ['y', ''], success=False)
+
+    def test_conflicting_backup_options_are_rejected(self):
+        self.run_shell('main --no-backup --backup-dir /media/recovery nda0', success=False)
+        self.run_shell('main --backup-dir /media/recovery --no-backup nda0', success=False)
+        self.run_shell('main --backup-dir "" nda0', success=False)
+
+    def test_interactive_disk_and_backup_selection(self):
+        self.mock_flow(interactive=True, backup=True)
+
+    def test_interactive_disk_without_persistent_backup(self):
+        self.mock_flow(interactive=True)
 
     def test_dry_run_writes_no_disk_or_configuration(self):
         self.mock_flow(dry=True)

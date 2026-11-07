@@ -12,18 +12,63 @@ step() { printf '\n==> %s\n' "$*"; }
 usage() {
     cat <<'HELP'
 Usage:
-  sh freebsd-zfs-geli-install.sh [--dry-run] [--backup-dir DIRECTORY] DISK
+  sh freebsd-zfs-geli-install.sh [--dry-run] [--backup-dir DIRECTORY | --no-backup] [DISK]
 
 Run once from bsdinstall's partitioning Shell, booted in UEFI mode.
 After success, type exit and complete bsdinstall normally.
 --dry-run checks prerequisites and prints a plan; it makes no disk changes.
---backup-dir retains recovery files in a NEW subdirectory of your chosen directory.
-Without it, the external recovery copy is temporary and lost on reboot.
+Omit DISK to choose from the detected devices. No disk is selected by default.
+Without backup options, you are asked whether and where to retain recovery files.
+--backup-dir DIRECTORY selects an existing directory; --no-backup skips that question.
+Without a destination, the external recovery copy is temporary and lost on reboot.
 HELP
 }
 require_device() { [ -c "/dev/$1" ] || fail "Missing device /dev/$1."; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "Required tool not found: $1"; }
 read_answer() { IFS= read -r ANSWER || fail 'Input cancelled.'; }
+choose_disk() {
+    DISKS=$(sysctl -n kern.disks) || fail 'Cannot discover disks.'
+    [ -n "$DISKS" ] || fail 'No disks were detected.'
+    printf '\nAvailable devices (check model, serial, capacity and partition layout):\n'
+    DISK_COUNT=0
+    for device in $DISKS; do
+        case "$device" in *[!a-zA-Z0-9]*|'') fail 'Unsupported disk name reported by the system.' ;; esac
+        DISK_COUNT=$((DISK_COUNT + 1))
+        printf '\n[%s] /dev/%s\n' "$DISK_COUNT" "$device"
+        diskinfo -v "/dev/$device" || printf 'Device details unavailable; this device may be unsuitable.\n'
+    done
+    printf '\nThe list may include the installer media. Select the installation disk carefully.\n'
+    while :; do
+        printf 'Disk number [q = cancel]: '
+        read_answer
+        case "$ANSWER" in
+            q|Q) fail 'Cancelled. No disk changes were made.' ;;
+            ''|*[!0-9]*|0*) printf 'Enter a listed number, or q.\n'; continue ;;
+        esac
+        [ "${#ANSWER}" -le 6 ] && [ "$ANSWER" -le "$DISK_COUNT" ] || { printf 'Enter a listed number, or q.\n'; continue; }
+        DISK=$(printf '%s\n' "$DISKS" | awk -v n="$ANSWER" '{for(i=1;i<=NF;i++) {k++; if(k==n) print $i}}')
+        [ -n "$DISK" ] || fail 'Cannot resolve selected disk.'
+        return
+    done
+}
+choose_backup() {
+    [ "${BACKUP_MODE:-ask}" = ask ] || return 0
+    printf '\nKeep a recovery backup outside the installer?\nThis saves GPT, EFI and GELI recovery data, not your operating systems or personal files.\n'
+    while :; do
+        printf 'Save a recovery backup? [y/N]: '
+        read_answer
+        case "$ANSWER" in
+            y|Y|yes|YES|Yes|s|S|sim|SIM|Sim)
+                printf 'Existing destination directory (for example /media/recovery; blank = cancel): '
+                read_answer
+                [ -n "$ANSWER" ] || fail 'Backup selection cancelled. No disk changes were made.'
+                BACKUP_DIR=$ANSWER
+                return ;;
+            n|N|no|NO|No|nao|'') BACKUP_DIR=''; return ;;
+            *) printf 'Enter y or n.\n' ;;
+        esac
+    done
+}
 # Restrict decimal input BEFORE shell arithmetic. Values stay below 2^53,
 # allowing exact integer comparisons in awk as well as safe signed shell math.
 uint() {
@@ -185,6 +230,7 @@ prepare() {
     plan_sectors
     printf '\nPlan (logical sectors, end exclusive):\n  Swap: start=%s size=%s\n  ZFS: start=%s size=%s end=%s\n  ESP: /dev/%s (no formatting)\n  Existing boot priority: preserved; FreeBSD appended during this execution\n' "$START" "$SWAP_SECTORS" "$ZFS_START" "$ZFS_SECTORS" "$((ZFS_START + ZFS_SECTORS))" "$ESP_PART"
     printf '  GELI: AES-XTS, 256-bit key, 4096-byte sectors\n  ZFS: zroot/ROOT/default and shared /home, /tmp, /var datasets\n'
+    choose_backup
     if [ -n "$BACKUP_DIR" ]; then
         path_safe "$BACKUP_DIR"
         [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ] || fail 'Backup directory must already exist and be writable.'
@@ -193,7 +239,7 @@ prepare() {
         printf '  Recovery destination: %s (ensure this is another, persistent medium)\n' "$BACKUP_DIR"
         df -h "$BACKUP_DIR" || fail 'Cannot inspect backup destination.'
     else
-        printf '\nWARNING: Recovery files will be temporary and LOST ON REBOOT.\nUse --backup-dir on another mounted medium to retain them.\n'
+        printf '\nWARNING: Recovery files will be temporary and LOST ON REBOOT.\nChoose a directory on another mounted medium to retain them.\n'
     fi
     [ "$DRY_RUN" -eq 0 ] || { printf '\nDry run complete. No partitions, pools, configuration or ESP files were written.\n'; return; }
     printf '\nType INSTALL %s to write this plan: ' "$DISK"
@@ -343,6 +389,8 @@ install_boot() {
 main() {
     DRY_RUN=0
     BACKUP_DIR=''
+    BACKUP_MODE=ask
+    DISK=''
     SESSION=''
     ESP_MOUNTED=0
     ORDER_PENDING=0
@@ -350,14 +398,20 @@ main() {
         case "$1" in
             --help|-h) usage; return ;;
             --dry-run) DRY_RUN=1; shift ;;
-            --backup-dir) [ "$#" -ge 2 ] || fail 'Missing backup directory.'; BACKUP_DIR=$2; shift 2 ;;
+            --backup-dir)
+                [ "$#" -ge 2 ] && [ -n "$2" ] || fail 'Missing backup directory.'
+                [ "$BACKUP_MODE" = ask ] || fail 'Specify only one backup option.'
+                BACKUP_DIR=$2; BACKUP_MODE=directory; shift 2 ;;
+            --no-backup)
+                [ "$BACKUP_MODE" = ask ] || fail 'Specify only one backup option.'
+                BACKUP_MODE=skip; shift ;;
             --*) fail "Unknown option: $1" ;;
-            *) [ "$#" -eq 1 ] || fail 'Specify one disk.'; DISK=${1#/dev/}; shift ;;
+            *) [ -z "$DISK" ] || fail 'Specify one disk.'; DISK=${1#/dev/}; shift ;;
         esac
     done
-    [ -n "${DISK:-}" ] || { usage; fail 'Specify a disk.'; }
-    case "$DISK" in ''|*[!a-zA-Z0-9]*) fail 'Invalid disk name (example: nda0).' ;; esac
+    case "$DISK" in *[!a-zA-Z0-9]*) fail 'Invalid disk name (example: nda0).' ;; esac
     preflight
+    [ -n "$DISK" ] || choose_disk
     prepare
 }
 main "$@"

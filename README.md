@@ -2,14 +2,14 @@
 
 Helper for **FreeBSD 15.1, amd64, UEFI**, used from the **Shell** partitioning
 option in `bsdinstall`. It installs into unallocated space on a GPT disk that
-already has exactly one EFI System Partition (ESP), for example a disk containing
-Debian. Existing partitions are neither resized nor formatted.
+already has exactly one EFI System Partition (ESP) and one or more existing
+operating systems. Existing partitions are neither resized nor formatted.
 
 This is a fresh-install helper, not an upgrader or a recovery/resume tool. It
 refuses disks containing existing `freebsd-*` partitions, an imported `zroot`,
 multiple suitable free regions, and an existing `EFI/freebsd` directory. Keep a
 backup of your existing operating system: the optional recovery files below are
-not a backup of Debian or your personal data.
+not a backup of existing operating systems or your personal data.
 
 ## Installation
 
@@ -65,7 +65,8 @@ that passphrase.
 GELI and ZFS, copies `/boot/loader.efi` from the **FreeBSD 15.1 installer media**
 to `EFI/freebsd/loader.efi` on the existing ESP, verifies that copy, creates a
 uniquely named UEFI entry and appends it to the original `BootOrder`.
-It does not replace Debian, GRUB, shim, or the fallback `EFI/BOOT` loader.
+It does not replace existing operating systems' EFI loaders or the fallback
+`EFI/BOOT` loader.
 Use installer media for the same release you are installing; this is not a
 mechanism for booting a newer installation with an older loader.
 
@@ -75,8 +76,9 @@ No Live CD detour or second script command is required. Do not reboot before
 
 The previous default boot priority is retained. Select
 `FreeBSD-<installation-id>` from your firmware's boot menu to boot FreeBSD.
-The helper does not add an item to GRUB. Firmware-specific behavior and the
-first encrypted boot still require a real machine/VM test.
+The helper does not add entries to other operating systems' boot menus.
+Firmware-specific behavior and the first encrypted boot still require a real
+machine/VM test.
 
 ## Security and layout
 
@@ -106,8 +108,8 @@ first encrypted boot still require a real machine/VM test.
   `/boot/efi`. The reviewed 15.1 `bsdinstall bootconfig` manages the ESP only when
   it finds a `/boot/efi` entry. This avoids a second writer changing the loader
   or boot priority later in installation. After boot, use `mount /efi` for
-  explicit loader maintenance, then `umount /efi`. Existing Debian and fallback
-  EFI files must be preserved during maintenance too.
+  explicit loader maintenance, then `umount /efi`. Preserve existing operating
+  systems' EFI loaders and the fallback EFI loader during maintenance too.
 - Standard `BSDINSTALL_CHROOT`, `BSDINSTALL_TMPETC`, `BSDINSTALL_TMPBOOT` and
   `PATH_FSTAB` paths are respected. Paths must be absolute/canonical and have no
   whitespace. Existing installer plans/configuration are not silently reused.
@@ -154,18 +156,18 @@ python3 -B -m unittest discover -s tests -v
 The host regression suite mocks FreeBSD commands. It covers size overflow,
 512/4096-byte sector plans, bounds, mount checks, identifier parsing, dry-run
 behavior, single-execution installation setup with and without swap and persistent backups,
-preservation of Debian and fallback EFI files, and failures of pool queries,
+preservation of existing OS and fallback EFI files, and failures of pool queries,
 partition creation, GELI and UEFI writes (including a catchable interruption).
 These checks do not establish that GELI, firmware, FAT, ZFS mounts or booting
 work on a real FreeBSD system.
 
 Before using this revision on a machine with valuable data, validate in a UEFI
-VM with a disposable GPT disk containing Debian and its ESP:
+VM with a disposable GPT disk containing an existing operating system and its ESP:
 
 1. Install with/without swap and with a fixed/remaining-space ZFS size.
-2. Compare all pre-existing partition boundaries and hashes of Debian's ESP files;
+2. Compare all pre-existing partition boundaries and hashes of the existing EFI files;
    confirm existing boot priority and the fallback loader are unchanged.
-3. Boot Debian, then select FreeBSD in the firmware menu and unlock GELI.
+3. Boot the existing operating system(s), then select FreeBSD in the firmware menu and unlock GELI.
 4. Create and activate another BE with `bectl`; verify that it boots and `/home`
    remains shared.
 5. Exercise insufficient ESP space, existing FreeBSD EFI files, a changed GPT,
